@@ -147,6 +147,7 @@ async function openWork(id) {
   $('#shift-panel').hidden = true;
   $('#shift-offset').value = '';
   $('#shift-select-all').checked = false;
+  $('#review-show-closed').checked = false;
 
   $('#work-title-display').textContent = r.work.title;
   $('#work-filename').textContent = r.work.filename;
@@ -158,6 +159,12 @@ async function openWork(id) {
   renderCues();
   updateShiftCount();
   await loadWorks();
+  // 载入该作品的待审提案（不阻断主视图：失败时仅提示）
+  try {
+    await loadProposals();
+  } catch (err) {
+    $('#review-rev').textContent = `待审区加载失败：${err.message}`;
+  }
 }
 
 function renderCues() {
@@ -223,13 +230,24 @@ function renderCues() {
 
     // 保存
     const saveTd = document.createElement('td');
+    const cell = document.createElement('div');
+    cell.className = 'prop-cell';
     const saveBtn = document.createElement('button');
     saveBtn.className = 'save-btn';
     saveBtn.textContent = '保存';
     saveBtn.addEventListener('click', () =>
       saveCue(tr, cue, { startInput, endInput, ta, rowMsg, saveBtn })
     );
-    saveTd.appendChild(saveBtn);
+    // 提候选：把当前输入作为候选提交到待审区，不直接改正式段
+    const proposeBtn = document.createElement('button');
+    proposeBtn.type = 'button';
+    proposeBtn.className = 'propose-btn';
+    proposeBtn.textContent = '提候选';
+    proposeBtn.addEventListener('click', () =>
+      openProposalModal(cue, startInput.value.trim(), endInput.value.trim(), ta.value)
+    );
+    cell.append(saveBtn, proposeBtn);
+    saveTd.appendChild(cell);
 
     const onEdit = () => markDirty(tr, cue);
     startInput.addEventListener('input', onEdit);
@@ -316,6 +334,8 @@ async function saveCue(tr, cue, els) {
     $('#stale-banner').hidden = true;
     // 本地修订号已推进，此前的批量平移预览失效
     invalidateShiftPreview();
+    // 正式段变化会影响待审提案的“当前正式值/冲突”状态
+    loadProposals().catch(() => {});
   } catch (err) {
     tr.classList.add('row-err');
     rowMsg.classList.add('error');
@@ -575,6 +595,294 @@ $('#shift-confirm-btn').addEventListener('click', async () => {
     }
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：提交候选修改                                              */
+/* ------------------------------------------------------------------ */
+
+const proposalModal = {
+  cue: null,
+};
+
+function openProposalModal(cue, start, end, text) {
+  if (!state.current) return;
+  proposalModal.cue = cue;
+  $('#proposal-cue-ref').textContent = `#${cue.idx}（段 ID ${cue.id}）`;
+  $('#proposal-revision').textContent = state.current.work.revision;
+  $('#proposal-start').value = start || cue.start;
+  $('#proposal-end').value = end || cue.end;
+  $('#proposal-text').value = text !== undefined ? text : cue.text;
+  $('#proposal-note').value = '';
+  const msg = $('#proposal-msg');
+  msg.className = 'msg';
+  msg.textContent = '';
+  $('#proposal-modal').hidden = false;
+  $('#proposal-start').focus();
+}
+
+function closeProposalModal() {
+  $('#proposal-modal').hidden = true;
+  proposalModal.cue = null;
+}
+
+$('#proposal-cancel').addEventListener('click', closeProposalModal);
+$('#proposal-modal').addEventListener('click', (e) => {
+  if (e.target === $('#proposal-modal')) closeProposalModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#proposal-modal').hidden) closeProposalModal();
+});
+
+$('#proposal-submit').addEventListener('click', async () => {
+  const cue = proposalModal.cue;
+  if (!cue || !state.current) return;
+  const msg = $('#proposal-msg');
+  msg.className = 'msg';
+  msg.textContent = '提交中…';
+  const btn = $('#proposal-submit');
+  btn.disabled = true;
+  try {
+    const r = await api('POST', `/api/works/${state.current.work.id}/proposals`, {
+      revision: state.current.work.revision,
+      cue_id: cue.id,
+      start: $('#proposal-start').value.trim(),
+      end: $('#proposal-end').value.trim(),
+      text: $('#proposal-text').value,
+      note: $('#proposal-note').value,
+      submitter: state.editor || null,
+    });
+    msg.className = 'msg ok';
+    msg.textContent = `候选已进入待审区（提案 #${r.proposal.id}），正式段与修订号未改变。`;
+    await loadProposals();
+    // 短暂展示成功后关闭
+    setTimeout(closeProposalModal, 600);
+  } catch (err) {
+    msg.className = 'msg error';
+    if (err.status === 409 && err.data.error === 'revision_stale') {
+      state.current.work.revision = err.data.latest_revision;
+      $('#work-revision').textContent = err.data.latest_revision;
+      msg.textContent =
+        `页面修订号已过期（最新 ${err.data.latest_revision}），候选未提交。` +
+        '请重新载入作品、确认所依据的原段内容后再提交候选。';
+    } else {
+      msg.textContent = err.message;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：列表 / 三栏并列 / 采纳 / 驳回                             */
+/* ------------------------------------------------------------------ */
+
+async function loadProposals() {
+  if (!state.current) return;
+  const showClosed = $('#review-show-closed').checked;
+  const r = await api(
+    'GET',
+    `/api/works/${state.current.work.id}/proposals${showClosed ? '?status=all' : ''}`
+  );
+  // 列表始终基于服务器最新修订号渲染
+  state.current.work.revision = r.revision;
+  $('#work-revision').textContent = r.revision;
+  $('#review-rev').textContent = `作品修订号 ${r.revision}`;
+  renderProposals(r.proposals, showClosed, r.open_count);
+}
+
+function valueBlock(title, v, cls, tag) {
+  const col = document.createElement('div');
+  col.className = `prop-col ${cls}`;
+  const h = document.createElement('h5');
+  h.textContent = title;
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'badge changed';
+    t.textContent = tag;
+    h.appendChild(t);
+  }
+  const tc = document.createElement('div');
+  tc.className = 'tc';
+  tc.textContent = `${v.start}\n→ ${v.end}`;
+  const pre = document.createElement('pre');
+  pre.textContent = v.text;
+  col.append(h, tc, pre);
+  return col;
+}
+
+function renderProposals(proposals, showClosed, openCount) {
+  const open = proposals.filter((p) => p.status === 'open');
+  const closed = proposals.filter((p) => p.status !== 'open');
+
+  $('#review-count').textContent = `${openCount ?? open.length} 条待审`;
+  $('#review-empty').hidden = open.length > 0;
+
+  const list = $('#review-list');
+  list.innerHTML = '';
+  for (const p of open) list.appendChild(renderProposalCard(p, false));
+
+  const closedWrap = $('#review-closed-wrap');
+  const closedList = $('#review-closed-list');
+  closedList.innerHTML = '';
+  if (showClosed && closed.length > 0) {
+    closedWrap.hidden = false;
+    for (const p of closed) closedList.appendChild(renderProposalCard(p, true));
+  } else {
+    closedWrap.hidden = true;
+  }
+}
+
+function renderProposalCard(p, isClosed) {
+  const card = document.createElement('div');
+  card.className = `prop-card ${p.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'prop-head';
+  const left = document.createElement('span');
+  const statusText = { open: '待审', accepted: '已采纳', rejected: '已驳回' }[p.status] || p.status;
+  left.innerHTML =
+    `<span class="who">${p.submitter ? escapeHtml(p.submitter) : '匿名提交'}</span> 的候选修改`;
+  const ref = document.createElement('span');
+  ref.textContent = `字幕段 #${p.cue_idx}（ID ${p.cue_id}）· 提案 #${p.id} · 依据修订号 ${p.base_revision} · ${p.created_at}`;
+  const badge = document.createElement('span');
+  badge.className = `badge ${p.status}`;
+  badge.textContent = statusText;
+  left.appendChild(badge);
+  head.append(left, ref);
+
+  // 三栏并列：原值（快照）/ 候选值 / 当前正式值
+  const grid = document.createElement('div');
+  grid.className = 'prop-grid';
+  grid.appendChild(valueBlock('原值（提交时快照）', p.original, 'original'));
+  grid.appendChild(valueBlock('候选值', p.candidate, 'candidate'));
+  const currentTag = p.target_changed ? '正式值已变化' : '';
+  grid.appendChild(
+    valueBlock(
+      '当前正式值',
+      p.current || { start: '—', end: '—', text: '（目标段已不存在）' },
+      `current ${p.target_changed ? 'changed' : 'same'}`,
+      currentTag
+    )
+  );
+
+  card.append(head, grid);
+
+  if (p.note) {
+    const note = document.createElement('p');
+    note.className = 'prop-note';
+    note.textContent = `说明：${p.note}`;
+    card.appendChild(note);
+  }
+
+  // 待审且目标已变 / 当前交叠：就地提示冲突原因
+  if (!isClosed) {
+    const warnings = [];
+    if (p.target_changed) {
+      warnings.push('目标段自提案以来已被修改：采纳会被拒绝以避免覆盖，请人工对照后决定驳回，或等待重新提案。');
+    }
+    if (p.conflicts.length > 0) {
+      warnings.push(
+        '候选时间段当前与 ' +
+          p.conflicts.map((c) => `#${c.idx}（${c.start} → ${c.end}）`).join('；') +
+          ' 交叠（首尾相接不算交叠），现在采纳会被拒绝。'
+      );
+    }
+    if (warnings.length > 0) {
+      const warn = document.createElement('p');
+      warn.className = 'prop-warn';
+      warn.textContent = '⚠ ' + warnings.join('\n');
+      card.appendChild(warn);
+    }
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'prop-actions';
+  if (isClosed) {
+    const result = document.createElement('span');
+    result.className = `prop-result ${p.status === 'accepted' ? 'accepted' : ''}`;
+    result.textContent =
+      (p.status === 'accepted' ? '✓ 已采纳' : '✕ 已驳回') +
+      (p.reviewer ? ` · 处理人：${p.reviewer}` : '') +
+      (p.closed_at ? ` · ${p.closed_at}` : '');
+    actions.appendChild(result);
+  } else {
+    const acceptBtn = document.createElement('button');
+    acceptBtn.type = 'button';
+    acceptBtn.className = 'primary';
+    acceptBtn.textContent = '采纳';
+    acceptBtn.addEventListener('click', () => decideProposal(p, 'accept', acceptBtn, actions));
+    const rejectBtn = document.createElement('button');
+    rejectBtn.type = 'button';
+    rejectBtn.className = 'danger';
+    rejectBtn.textContent = '驳回';
+    rejectBtn.addEventListener('click', () => decideProposal(p, 'reject', rejectBtn, actions));
+    const hint = document.createElement('span');
+    hint.className = 'prop-result';
+    hint.textContent = '驳回只结案；采纳前服务器会再次比对快照与时间/交叠。';
+    actions.append(acceptBtn, rejectBtn, hint);
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+
+async function decideProposal(p, action, btn, actions) {
+  if (action === 'reject' && !confirm(`确定驳回提案 #${p.id} 吗？驳回只结案，不修改正式段。`)) {
+    return;
+  }
+  btn.disabled = true;
+  const oldMsgs = actions.querySelectorAll('.prop-inline-msg');
+  oldMsgs.forEach((el) => el.remove());
+  const inline = document.createElement('span');
+  inline.className = 'prop-inline-msg prop-result';
+  actions.appendChild(inline);
+  try {
+    if (action === 'accept') {
+      const r = await api('POST', `/api/works/${state.current.work.id}/proposals/${p.id}/accept`, {
+        reviewer: state.editor || null,
+      });
+      // 采纳成功：正式段已更新、修订号 +1、序号重排；整体刷新作品与待审区
+      await openWork(state.current.work.id);
+      return;
+    }
+    await api('POST', `/api/works/${state.current.work.id}/proposals/${p.id}/reject`, {
+      reviewer: state.editor || null,
+    });
+    await loadProposals();
+  } catch (err) {
+    btn.disabled = false;
+    if (err.status === 409 && err.data.error === 'proposal_closed') {
+      inline.textContent = '该提案已结案，不可再次处理。';
+      await loadProposals();
+    } else if (err.status === 409 && err.data.error === 'target_changed') {
+      inline.textContent = `未采纳：${err.data.message}`;
+      inline.style.color = 'var(--danger)';
+      state.current.work.revision = err.data.latest_revision;
+      $('#work-revision').textContent = err.data.latest_revision;
+      await loadProposals();
+    } else if (err.status === 422 && err.data.error === 'accept_rejected') {
+      const overlap = (err.data.issues || []).find((i) => i.type === 'overlap');
+      inline.textContent = overlap
+        ? `未采纳：${overlap.message}`
+        : `未采纳：${err.data.message}`;
+      inline.style.color = 'var(--danger)';
+      await loadProposals();
+    } else {
+      inline.textContent = err.message;
+      inline.style.color = 'var(--danger)';
+    }
+  }
+}
+
+$('#review-refresh').addEventListener('click', () => loadProposals().catch((err) => {
+  $('#review-rev').textContent = `刷新失败：${err.message}`;
+}));
+$('#review-show-closed').addEventListener('change', () => loadProposals());
 
 /* ------------------------------------------------------------------ */
 /* 离开页面前提醒未保存修改                                            */

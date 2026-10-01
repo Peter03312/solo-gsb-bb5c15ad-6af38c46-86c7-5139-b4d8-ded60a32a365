@@ -556,6 +556,316 @@ async function main() {
     assert.strictEqual(noArr.json.error, 'invalid_selection');
   });
 
+  /* ---------------- 待审提案（多人校订） ---------------- */
+
+  // 提案作品：#1 1-2s  #2 3-4s  #3 5-6s  #4 7-8s
+  const PROP_SRT =
+    '1\n00:00:01,000 --> 00:00:02,000\n原一\n\n' +
+    '2\n00:00:03,000 --> 00:00:04,000\n原二\n\n' +
+    '3\n00:00:05,000 --> 00:00:06,000\n原三\n\n' +
+    '4\n00:00:07,000 --> 00:00:08,000\n原四\n';
+  let propWorkId;
+  let pIds = {};
+  let firstProposalId;
+
+  await test('提案：上传测试作品（4 段，修订号 1）', async () => {
+    const r = await call('POST', '/api/works', { title: '提案片', filename: 'prop.srt', content: PROP_SRT });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    propWorkId = r.json.id;
+    const d = await call('GET', `/api/works/${propWorkId}`);
+    [1, 2, 3, 4].forEach((i) => {
+      pIds[i] = byIdx(d.json.cues, i).id;
+    });
+  });
+
+  await test('提案：携带页面修订号提交候选，201 且保存原段快照', async () => {
+    const r = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 1,
+      cue_id: pIds[1],
+      start: '00:00:01,000',
+      end: '00:00:02,000',
+      text: '候选一\n第二行',
+      note: '听录修正',
+      submitter: '提交人甲',
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 1, '提交时返回页面所依据修订号');
+    const p = r.json.proposal;
+    firstProposalId = p.id;
+    assert.strictEqual(p.status, 'open');
+    assert.strictEqual(p.base_revision, 1);
+    assert.strictEqual(p.cue_id, pIds[1]);
+    assert.deepStrictEqual(p.original, {
+      start_ms: 1000, end_ms: 2000, start: '00:00:01,000', end: '00:00:02,000', text: '原一',
+    });
+    assert.strictEqual(p.candidate.text, '候选一\n第二行');
+    assert.strictEqual(p.current.text, '原一');
+    assert.strictEqual(p.target_changed, false);
+    assert.deepStrictEqual(p.conflicts, []);
+  });
+
+  await test('提案：提交不改变正式段、作品修订号与导出', async () => {
+    const d = await call('GET', `/api/works/${propWorkId}`);
+    assert.strictEqual(d.json.work.revision, 1);
+    assert.strictEqual(d.json.work.open_proposals, 1);
+    assert.strictEqual(d.json.cues[0].text, '原一');
+    assert.strictEqual(d.json.cues[0].start, '00:00:01,000');
+    const body = await (await fetch(base + `/api/works/${propWorkId}/export`)).text();
+    assert.ok(body.includes('原一'), '导出仍为正式段原文');
+    assert.ok(!body.includes('候选一'), '候选文字不得进入导出');
+  });
+
+  await test('提案：修订号过期拒绝且不生成提案（409 带最新值）', async () => {
+    // 先制造一次正式修改把修订号推到 2
+    const edit = await call('PUT', `/api/works/${propWorkId}/cues/${pIds[4]}`, {
+      revision: 1,
+      start: '00:00:07,000',
+      end: '00:00:08,500',
+      text: '原四加长',
+    });
+    assert.strictEqual(edit.status, 200);
+    const r = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 1, // 过期
+      cue_id: pIds[1],
+      start: '00:00:01,000',
+      end: '00:00:02,000',
+      text: '过期候选',
+    });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.json.error, 'revision_stale');
+    assert.strictEqual(r.json.latest_revision, 2);
+    const list = await call('GET', `/api/works/${propWorkId}/proposals`);
+    assert.strictEqual(list.json.proposals.length, 1, '过期提交不得新增提案');
+    assert.ok(!list.json.proposals.some((p) => p.candidate.text === '过期候选'));
+  });
+
+  await test('提案：候选内容非法（格式/负时间/区间/空文字/段不存在）均拒绝且不生成', async () => {
+    const url = `/api/works/${propWorkId}/proposals`;
+    const baseBody = { revision: 2, cue_id: pIds[1] };
+    const badTime = await call('POST', url, { ...baseBody, start: '1秒', end: '00:00:02,000', text: 'x' });
+    assert.strictEqual(badTime.status, 400);
+    assert.strictEqual(badTime.json.error, 'invalid_time');
+    const negative = await call('POST', url, { ...baseBody, start: '-00:00:01,000', end: '00:00:02,000', text: 'x' });
+    // 负号不属于合法时间码 -> 格式 400
+    assert.ok(negative.status === 400 || negative.status === 422, JSON.stringify(negative.json));
+    const range = await call('POST', url, { ...baseBody, start: '00:00:03,000', end: '00:00:02,000', text: 'x' });
+    assert.strictEqual(range.status, 422);
+    assert.strictEqual(range.json.error, 'invalid_range');
+    const empty = await call('POST', url, { ...baseBody, start: '00:00:01,000', end: '00:00:02,000', text: '   ' });
+    assert.strictEqual(empty.status, 400);
+    assert.strictEqual(empty.json.error, 'invalid_text');
+    const noCue = await call('POST', url, { revision: 2, cue_id: 999999, start: '00:00:01,000', end: '00:00:02,000', text: 'x' });
+    assert.strictEqual(noCue.status, 404);
+    assert.strictEqual(noCue.json.error, 'cue_not_found');
+    const list = await call('GET', url);
+    assert.strictEqual(list.json.proposals.length, 1, '所有非法提交都不得生成提案');
+  });
+
+  await test('提案：驳回只结案，正式段与修订号不变；已结案不可再处理', async () => {
+    const r = await call('POST', `/api/works/${propWorkId}/proposals/${firstProposalId}/reject`, {
+      reviewer: '审阅人乙',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.proposal.status, 'rejected');
+    assert.strictEqual(r.json.proposal.reviewer, '审阅人乙');
+
+    const d = await call('GET', `/api/works/${propWorkId}`);
+    assert.strictEqual(d.json.work.revision, 2, '驳回不推进修订号');
+    assert.strictEqual(d.json.cues[0].text, '原一');
+    assert.strictEqual(d.json.work.open_proposals, 0);
+
+    const againReject = await call('POST', `/api/works/${propWorkId}/proposals/${firstProposalId}/reject`, {});
+    assert.strictEqual(againReject.status, 409);
+    assert.strictEqual(againReject.json.error, 'proposal_closed');
+    const acceptClosed = await call('POST', `/api/works/${propWorkId}/proposals/${firstProposalId}/accept`, {});
+    assert.strictEqual(acceptClosed.status, 409);
+    assert.strictEqual(acceptClosed.json.error, 'proposal_closed');
+  });
+
+  await test('提案：采纳成功——更新正式段、修订号 +1、重排序号', async () => {
+    // 新候选：#1 原 1-2s 改到 8.5-9.5s（不与加长后的 #4 7-8.5s 交叠，首尾留间隙），
+    // 采纳后该段应重排到最后（idx=4）
+    const created = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 2,
+      cue_id: pIds[1],
+      start: '00:00:08,500',
+      end: '00:00:09,500',
+      text: '原一移到最后',
+      note: '时间轴整体错位',
+      submitter: '提交人甲',
+    });
+    assert.strictEqual(created.status, 201, JSON.stringify(created.json));
+    const pid = created.json.proposal.id;
+
+    const r = await call('POST', `/api/works/${propWorkId}/proposals/${pid}/accept`, {
+      reviewer: '审阅人乙',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 3);
+    assert.strictEqual(r.json.proposal.status, 'accepted');
+    assert.strictEqual(r.json.cue.id, pIds[1]);
+    assert.strictEqual(r.json.cue.start, '00:00:08,500');
+    assert.strictEqual(r.json.cue.end, '00:00:09,500');
+    assert.strictEqual(r.json.cue.text, '原一移到最后');
+    assert.strictEqual(r.json.cue.idx, 4, '应按新时间重排为第 4 段');
+
+    const d = await call('GET', `/api/works/${propWorkId}`);
+    assert.strictEqual(d.json.work.revision, 3);
+    assert.deepStrictEqual(d.json.cues.map((c) => c.text), ['原二', '原三', '原四加长', '原一移到最后']);
+    d.json.cues.forEach((c, i) => assert.strictEqual(c.idx, i + 1));
+  });
+
+  await test('提案：其他段的修改不阻止采纳（只比对目标段快照）', async () => {
+    // rev3 时间线：原二 3-4、原三 5-6、原四加长 7-8.5、原一移到最后 8.5-9.5
+    // 针对 #2（原二，自 rev3 起未被改动）在 rev2 视角之外提交候选——此时修订号 3
+    const created = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 3,
+      cue_id: pIds[2],
+      start: '00:00:03,000',
+      end: '00:00:04,200',
+      text: '原二改字',
+    });
+    assert.strictEqual(created.status, 201, JSON.stringify(created.json));
+    const pid = created.json.proposal.id;
+
+    // 他人修改了“其他段” #3，修订号推进到 4
+    const other = await call('PUT', `/api/works/${propWorkId}/cues/${pIds[3]}`, {
+      revision: 3,
+      start: '00:00:05,000',
+      end: '00:00:06,500',
+      text: '原三别人改',
+    });
+    assert.strictEqual(other.status, 200, JSON.stringify(other.json));
+
+    // 候选结束 4.2 < 原三起点 5，无交叠；目标段 #2 未变，采纳成功
+    const r = await call('POST', `/api/works/${propWorkId}/proposals/${pid}/accept`, {});
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 5);
+    assert.strictEqual(r.json.cue.text, '原二改字');
+  });
+
+  await test('提案：目标段已变 -> 409 保留待审，返回当前段，不写入', async () => {
+    // rev5：#3 已为 5-6.5 “原三别人改”。就 #3 当前值提交一个候选
+    const created = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 5,
+      cue_id: pIds[3],
+      start: '00:00:05,000',
+      end: '00:00:06,500',
+      text: '原三候选A',
+    });
+    assert.strictEqual(created.status, 201, JSON.stringify(created.json));
+    const pid = created.json.proposal.id;
+
+    // 目标段被直接保存改动（结束 6.5 -> 6.8），修订号到 6
+    const edit = await call('PUT', `/api/works/${propWorkId}/cues/${pIds[3]}`, {
+      revision: 5,
+      start: '00:00:05,000',
+      end: '00:00:06,800',
+      text: '原三别人又改',
+    });
+    assert.strictEqual(edit.status, 200);
+
+    const r = await call('POST', `/api/works/${propWorkId}/proposals/${pid}/accept`, {});
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.json.error, 'target_changed');
+    assert.strictEqual(r.json.latest_revision, 6);
+    assert.strictEqual(r.json.proposal.status, 'open', '目标已变时提案必须保留待审');
+    assert.strictEqual(r.json.proposal.target_changed, true);
+    assert.strictEqual(r.json.proposal.current.text, '原三别人又改');
+    assert.strictEqual(r.json.proposal.current.end, '00:00:06,800');
+    assert.ok(r.json.issues.some((i) => i.type === 'target_changed'));
+
+    const d = await call('GET', `/api/works/${propWorkId}`);
+    assert.strictEqual(d.json.work.revision, 6, '冲突采纳不得推进修订号');
+    assert.strictEqual(d.json.cues.find((c) => c.id === pIds[3]).text, '原三别人又改');
+    assert.strictEqual(d.json.work.open_proposals, 1);
+  });
+
+  await test('提案：当前产生交叠 -> 422 保留待审并指出冲突段，不写入；障碍移除后可采纳', async () => {
+    // rev6 时间线：原二改字 3-4.2、原三别人又改 5-6.8、原四加长 7-8.5、原一移到最后 8.5-9.5
+    // 对 #2 提交候选：移到 6000-6500（提交时与 #3 5-6.8 交叠，但提交只校验内容本身，允许进入待审）
+    const created = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 6,
+      cue_id: pIds[2],
+      start: '00:00:06,000',
+      end: '00:00:06,500',
+      text: '原二想插进六点',
+    });
+    assert.strictEqual(created.status, 201, JSON.stringify(created.json));
+    const pid = created.json.proposal.id;
+    assert.strictEqual(created.json.proposal.conflicts[0].id, pIds[3], '列表即标出当前冲突段 #3');
+
+    const r = await call('POST', `/api/works/${propWorkId}/proposals/${pid}/accept`, {});
+    assert.strictEqual(r.status, 422);
+    assert.strictEqual(r.json.error, 'accept_rejected');
+    assert.ok(r.json.issues.some((i) => i.type === 'overlap'));
+    assert.deepStrictEqual(r.json.issues.find((i) => i.type === 'overlap').cue_ids, [pIds[2], pIds[3]]);
+    assert.strictEqual(r.json.proposal.status, 'open');
+    const before = await call('GET', `/api/works/${propWorkId}`);
+    assert.strictEqual(before.json.work.revision, 6, '交叠采纳不得推进修订号');
+    assert.strictEqual(before.json.cues.find((c) => c.id === pIds[2]).text, '原二改字', '正式段不写入');
+
+    // 把障碍段 #3 挪开（5-5.5，与候选 6-6.5 首尾留间隙），修订号到 7；目标段 #2 未变
+    const move = await call('PUT', `/api/works/${propWorkId}/cues/${pIds[3]}`, {
+      revision: 6,
+      start: '00:00:05,000',
+      end: '00:00:05,500',
+      text: '原三别人又改',
+    });
+    assert.strictEqual(move.status, 200);
+
+    const ok = await call('POST', `/api/works/${propWorkId}/proposals/${pid}/accept`, {});
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.json));
+    assert.strictEqual(ok.json.revision, 8);
+    assert.strictEqual(ok.json.cue.start, '00:00:06,000');
+    assert.strictEqual(ok.json.cue.text, '原二想插进六点');
+  });
+
+  await test('提案：同段两条待审，采纳其一后另一条目标已变不可采纳', async () => {
+    // rev8：#4（原四加长 7-8.5）提交两条候选
+    const a = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 8, cue_id: pIds[4], start: '00:00:07,000', end: '00:00:08,500', text: '原四候选甲',
+    });
+    const b = await call('POST', `/api/works/${propWorkId}/proposals`, {
+      revision: 8, cue_id: pIds[4], start: '00:00:07,000', end: '00:00:08,000', text: '原四候选乙',
+    });
+    assert.strictEqual(a.status, 201);
+    assert.strictEqual(b.status, 201);
+
+    const acceptA = await call('POST', `/api/works/${propWorkId}/proposals/${a.json.proposal.id}/accept`, {});
+    assert.strictEqual(acceptA.status, 200);
+    assert.strictEqual(acceptA.json.revision, 9);
+
+    const acceptB = await call('POST', `/api/works/${propWorkId}/proposals/${b.json.proposal.id}/accept`, {});
+    assert.strictEqual(acceptB.status, 409);
+    assert.strictEqual(acceptB.json.error, 'target_changed');
+    assert.strictEqual(acceptB.json.proposal.status, 'open', '未采纳的另一条仍保留待审');
+    assert.strictEqual(acceptB.json.proposal.current.text, '原四候选甲');
+  });
+
+  await test('提案：列表支持仅待审/全部；并列返回原值候选值当前值', async () => {
+    const open = await call('GET', `/api/works/${propWorkId}/proposals`);
+    assert.strictEqual(open.status, 200);
+    assert.ok(open.json.proposals.every((p) => p.status === 'open'));
+    assert.strictEqual(open.json.open_count, open.json.proposals.length);
+
+    const all = await call('GET', `/api/works/${propWorkId}/proposals?status=all`);
+    assert.ok(all.json.proposals.length >= open.json.proposals.length);
+    assert.ok(all.json.proposals.some((p) => p.status === 'accepted'));
+    assert.ok(all.json.proposals.some((p) => p.status === 'rejected'));
+    const sample = all.json.proposals.find((p) => p.status === 'accepted');
+    assert.ok(sample.original && sample.candidate && sample.current, '三值并列');
+  });
+
+  await test('提案：删除作品级联清除其全部提案', async () => {
+    const list = await call('GET', `/api/works/${propWorkId}/proposals?status=all`);
+    assert.ok(list.json.proposals.length > 0);
+    const del = await call('DELETE', `/api/works/${propWorkId}`);
+    assert.strictEqual(del.status, 200);
+    const after = await call('GET', `/api/works/${propWorkId}/proposals`);
+    assert.strictEqual(after.status, 404);
+  });
+
   await test('持久化：用 openDb 重新打开文件，数据与修订号都在', async () => {
     const { openDb } = require('../src/db');
     const db2 = await openDb(process.env.DB_PATH);

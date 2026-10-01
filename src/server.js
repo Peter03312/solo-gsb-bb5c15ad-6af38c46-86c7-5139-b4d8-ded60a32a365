@@ -23,6 +23,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'subtitles.db');
 const MAX_TEXT_LEN = 10000;
 const MAX_TITLE_LEN = 200;
+const MAX_NOTE_LEN = 500;
 
 // sql.js 需要先加载 wasm，所有请求处理都会 await 此 promise
 const dbReady = openDb(DB_PATH).then((instance) => {
@@ -165,6 +166,152 @@ function loadCuesForShift(workId, cueIds) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 待审提案：快照值 / 候选值 / 当前正式值                              */
+/* ------------------------------------------------------------------ */
+
+function trimName(v) {
+  return typeof v === 'string' && v.trim() ? v.trim().slice(0, 80) : null;
+}
+
+/**
+ * 校验提案携带的候选内容：修订号格式、候选起止时间格式、非负、结束晚于开始、
+ * 文字合法性。不检查与其他段交叠——交叠随正式段变化，统一在采纳时重检。
+ * 返回 { revision, startMs, endMs, text }。
+ */
+function parseProposalBody(body) {
+  const b = body || {};
+
+  if (!Number.isInteger(b.revision) || b.revision < 1) {
+    throw new HttpError(400, 'invalid_revision', '缺少有效的作品修订号');
+  }
+
+  const startMs = parseTimeToMs(String(b.start ?? ''));
+  const endMs = parseTimeToMs(String(b.end ?? ''));
+  if (startMs === null || endMs === null) {
+    throw new HttpError(
+      400,
+      'invalid_time',
+      '时间格式应为 HH:MM:SS,mmm（例如 00:01:23,500）'
+    );
+  }
+  if (startMs < 0 || endMs < 0) {
+    throw new HttpError(422, 'negative_time', '时间不能为负数');
+  }
+  if (endMs <= startMs) {
+    throw new HttpError(422, 'invalid_range', '结束时间必须晚于开始时间');
+  }
+
+  const text = normalizeText(b.text);
+
+  let note = null;
+  if (b.note !== undefined && b.note !== null) {
+    if (typeof b.note !== 'string') {
+      throw new HttpError(400, 'invalid_note', '说明必须是字符串');
+    }
+    note = b.note.replace(/\r\n?/g, '\n').trim();
+    if (note.length > MAX_NOTE_LEN) {
+      throw new HttpError(400, 'invalid_note', `说明过长（上限 ${MAX_NOTE_LEN} 字）`);
+    }
+    note = note || null;
+  }
+
+  return { revision: b.revision, startMs, endMs, text, note };
+}
+
+/** 提案某一份“值”（原快照 / 候选 / 当前正式）的对外形态 */
+function valueView(startMs, endMs, text) {
+  return {
+    start_ms: startMs,
+    end_ms: endMs,
+    start: formatMs(startMs),
+    end: formatMs(endMs),
+    text,
+  };
+}
+
+/**
+ * 组装一条提案的完整对外形态：含原值、候选值，以及目标段的当前正式值。
+ * 同时标出目标段自快照以来是否已变化、按当前正式段计算候选值是否仍交叠。
+ */
+function presentProposal(p, cue) {
+  const base = {
+    id: p.id,
+    work_id: p.work_id,
+    cue_id: p.cue_id,
+    cue_idx: cue ? cue.idx : p.cue_idx,
+    status: p.status,
+    base_revision: p.base_revision,
+    note: p.note,
+    submitter: p.submitter,
+    reviewer: p.reviewer,
+    created_at: p.created_at,
+    closed_at: p.closed_at,
+    original: valueView(p.orig_start_ms, p.orig_end_ms, p.orig_text),
+    candidate: valueView(p.cand_start_ms, p.cand_end_ms, p.cand_text),
+  };
+
+  if (!cue) {
+    // 目标段已随作品删除（当前实现段不单独删除，仅作品级联删除，理论上不会出现）
+    return {
+      ...base,
+      cue_exists: false,
+      current: null,
+      target_changed: true,
+      conflicts: [],
+    };
+  }
+
+  const targetChanged =
+    cue.start_ms !== p.orig_start_ms ||
+    cue.end_ms !== p.orig_end_ms ||
+    cue.text !== p.orig_text;
+
+  // 按当前正式段重检候选值与其他段的交叠（半开区间，首尾相接允许）
+  const conflicts = db
+    .prepare(
+      `SELECT id, idx, start_ms, end_ms
+         FROM cues
+        WHERE work_id = ? AND id != ? AND start_ms < ? AND end_ms > ?
+        ORDER BY idx, id`
+    )
+    .all(p.work_id, cue.id, p.cand_end_ms, p.cand_start_ms)
+    .map((c) => ({
+      id: c.id,
+      idx: c.idx,
+      start: formatMs(c.start_ms),
+      end: formatMs(c.end_ms),
+    }));
+
+  return {
+    ...base,
+    cue_exists: true,
+    current: valueView(cue.start_ms, cue.end_ms, cue.text),
+    target_changed: targetChanged,
+    conflicts,
+  };
+}
+
+/** 列出某作品的提案（默认仅待审），并附当前待审总数 */
+function listProposals(workId, status) {
+  const ps = db
+    .prepare(
+      `SELECT * FROM proposals
+        WHERE work_id = ? ${status ? 'AND status = ?' : ''}
+        ORDER BY (status = 'open') DESC, id DESC`
+    )
+    .all(...(status ? [workId, status] : [workId]));
+
+  const cueIds = [...new Set(ps.map((p) => p.cue_id))];
+  const cueById = new Map();
+  for (const cueId of cueIds) {
+    const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND work_id = ?').get(cueId, workId);
+    if (cue) cueById.set(cueId, cue);
+  }
+
+  return ps.map((p) => presentProposal(p, cueById.get(p.cue_id) || null));
+}
+
+/* ------------------------------------------------------------------ */
 /* 作品：列表 / 详情 / 删除                                            */
 /* ------------------------------------------------------------------ */
 
@@ -172,9 +319,11 @@ app.get('/api/works', (req, res) => {
   const works = db
     .prepare(
       `SELECT w.id, w.title, w.filename, w.revision, w.created_at, w.updated_at,
-              COUNT(c.id) AS cue_count
+              COUNT(DISTINCT c.id) AS cue_count,
+              COUNT(DISTINCT p.id) AS open_proposals
          FROM works w
          LEFT JOIN cues c ON c.work_id = w.id
+         LEFT JOIN proposals p ON p.work_id = w.id AND p.status = 'open'
         GROUP BY w.id
         ORDER BY w.updated_at DESC, w.id DESC`
     )
@@ -189,6 +338,9 @@ app.get('/api/works/:id', (req, res, next) => {
       .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
       .all(work.id)
       .map(cueRow);
+    const openCount = db
+      .prepare("SELECT COUNT(*) AS n FROM proposals WHERE work_id = ? AND status = 'open'")
+      .get(work.id).n;
     res.json({
       work: {
         id: work.id,
@@ -197,6 +349,7 @@ app.get('/api/works/:id', (req, res, next) => {
         revision: work.revision,
         created_at: work.created_at,
         updated_at: work.updated_at,
+        open_proposals: openCount,
       },
       cues,
     });
@@ -479,6 +632,303 @@ app.post('/api/works/:id/cues/shift', (req, res, next) => {
       shifted_count: cueIds.length,
       cues: outcome.cues,
     });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：提交候选修改（不改变正式段与修订号）                      */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/works/:id/proposals', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const cueId = Number(req.body && req.body.cue_id);
+    if (!Number.isInteger(cueId) || cueId < 1) {
+      throw new HttpError(400, 'invalid_cue', '缺少有效的字幕段 ID（cue_id）');
+    }
+
+    const { revision, startMs, endMs, text, note } = parseProposalBody(req.body);
+    const submitter = trimName(req.body && req.body.submitter);
+    getWorkOr404(workId);
+
+    const outcome = db
+      .transaction((wId, cId, expectedRevision, candStart, candEnd, candText, candNote) => {
+        const w = db.prepare('SELECT revision FROM works WHERE id = ?').get(wId);
+        if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+
+        const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND work_id = ?').get(cId, wId);
+        if (!cue) throw new HttpError(404, 'cue_not_found', '目标字幕段不存在或不属于该作品');
+
+        // 页面所见修订号已过期：拒绝且不生成提案
+        if (w.revision !== expectedRevision) {
+          return { conflict: true, revision: w.revision, cue: db.prepare('SELECT * FROM cues WHERE id = ?').get(cId) };
+        }
+
+        const info = db
+          .prepare(
+            `INSERT INTO proposals
+               (work_id, cue_id, base_revision, cue_idx,
+                orig_start_ms, orig_end_ms, orig_text,
+                cand_start_ms, cand_end_ms, cand_text, note, submitter)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            wId, cId, w.revision, cue.idx,
+            cue.start_ms, cue.end_ms, cue.text,
+            candStart, candEnd, candText, candNote, submitter
+          );
+
+        const p = db.prepare('SELECT * FROM proposals WHERE id = ?').get(info.lastInsertRowid);
+        return { conflict: false, proposal: presentProposal(p, cue) };
+      })
+      .immediate(workId, cueId, revision, startMs, endMs, text, note);
+
+    if (outcome.conflict) {
+      throw new HttpError(409, 'revision_stale', '修订号已过期：该作品已被其他人修改，候选修改未提交', {
+        latest_revision: outcome.revision,
+        cue: cueRow(outcome.cue),
+      });
+    }
+
+    // 提交提案不改正式段、不推进作品修订号、不影响 SRT 导出
+    res.status(201).json({ revision, proposal: outcome.proposal });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：列表（默认仅待审，?status=all 含已结案）                  */
+/* ------------------------------------------------------------------ */
+
+app.get('/api/works/:id/proposals', (req, res, next) => {
+  try {
+    const work = getWorkOr404(req.params.id);
+    const filter = req.query.status === 'all' || req.query.status === 'closed'
+      ? req.query.status
+      : 'open';
+    const status = filter === 'all' ? null : filter === 'closed' ? 'closed' : 'open';
+    // 'closed' 为便捷别名：实际包含 accepted / rejected 两种结案状态
+    let proposals;
+    if (status === 'closed') {
+      const all = listProposals(work.id, null);
+      proposals = all.filter((p) => p.status !== 'open');
+    } else {
+      proposals = listProposals(work.id, status);
+    }
+    const openCount = db
+      .prepare("SELECT COUNT(*) AS n FROM proposals WHERE work_id = ? AND status = 'open'")
+      .get(work.id).n;
+    res.json({ revision: work.revision, open_count: openCount, proposals });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：采纳（单事务比对快照 → 重检 → 更新正式段）                */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/works/:id/proposals/:pid/accept', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const proposalId = Number(req.params.pid);
+    const reviewer = trimName(req.body && req.body.reviewer);
+    getWorkOr404(workId);
+
+    const outcome = db
+      .transaction((wId, pId) => {
+        const w = db.prepare('SELECT revision FROM works WHERE id = ?').get(wId);
+        if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+
+        const p = db.prepare('SELECT * FROM proposals WHERE id = ? AND work_id = ?').get(pId, wId);
+        if (!p) throw new HttpError(404, 'proposal_not_found', '提案不存在或不属于该作品');
+
+        // 已结案（已采纳/已驳回）不可再次处理
+        if (p.status !== 'open') {
+          return { closed: true, proposal: p };
+        }
+
+        const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND work_id = ?').get(p.cue_id, wId);
+        if (!cue) {
+          return {
+            targetChanged: true,
+            revision: w.revision,
+            proposal: presentProposal(p, null),
+            issues: [{ type: 'cue_missing', message: '目标字幕段已不存在' }],
+          };
+        }
+
+        // 必须确认目标段时间与文字仍与快照一致；其他段的修改不阻止采纳
+        if (
+          cue.start_ms !== p.orig_start_ms ||
+          cue.end_ms !== p.orig_end_ms ||
+          cue.text !== p.orig_text
+        ) {
+          return {
+            targetChanged: true,
+            revision: w.revision,
+            proposal: presentProposal(p, cue),
+            issues: [
+              {
+                type: 'target_changed',
+                message:
+                  '目标字幕段在提案提交后已被修改（正式值与快照不一致），为避免覆盖他人改动，本次未写入；请重新对照后处理',
+              },
+            ],
+          };
+        }
+
+        // 重新检查候选值：非负时间、结束晚于开始
+        const issues = [];
+        if (p.cand_start_ms < 0 || p.cand_end_ms < 0) {
+          issues.push({ type: 'negative_time', message: '候选时间为负数' });
+        }
+        if (p.cand_end_ms <= p.cand_start_ms) {
+          issues.push({ type: 'invalid_range', message: '候选结束时间必须晚于开始时间' });
+        }
+
+        // 重新检查与同作品其他段不交叠（半开区间，首尾相接允许）
+        const overlaps = db
+          .prepare(
+            `SELECT id, idx, start_ms, end_ms
+               FROM cues
+              WHERE work_id = ? AND id != ? AND start_ms < ? AND end_ms > ?
+              ORDER BY idx, id`
+          )
+          .all(wId, cue.id, p.cand_end_ms, p.cand_start_ms);
+        if (overlaps.length > 0) {
+          issues.push({
+            type: 'overlap',
+            cue_ids: [cue.id, ...overlaps.map((c) => c.id)],
+            cues: [{ id: cue.id, idx: cue.idx }, ...overlaps.map((c) => ({ id: c.id, idx: c.idx }))],
+            message:
+              `候选时间段 ${formatMs(p.cand_start_ms)} --> ${formatMs(p.cand_end_ms)}` +
+              ` 当前与 ${overlaps.length} 个字幕段交叠：${overlaps.map((c) => `#${c.idx}`).join('、')}` +
+              '（首尾相接不算交叠）',
+          });
+        }
+
+        if (issues.length > 0) {
+          // 目标虽未变但当前会产生交叠等：保留待审，返回当前段与冲突原因，不写入
+          return {
+            targetChanged: false,
+            rejectedByRules: true,
+            revision: w.revision,
+            proposal: presentProposal(p, cue),
+            issues,
+          };
+        }
+
+        // 全部通过：更新正式段、修订号 +1、重排序号，提案结案
+        db.prepare('UPDATE cues SET start_ms = ?, end_ms = ?, text = ? WHERE id = ?')
+          .run(p.cand_start_ms, p.cand_end_ms, p.cand_text, cue.id);
+
+        const nextRevision = w.revision + 1;
+        db.prepare("UPDATE works SET revision = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(nextRevision, wId);
+
+        db.prepare(
+          'INSERT INTO revisions_log (work_id, revision, editor, action, cue_id) VALUES (?, ?, ?, ?, ?)'
+        ).run(wId, nextRevision, reviewer, `accept proposal #${p.id}`, cue.id);
+
+        db.prepare(
+          "UPDATE proposals SET status = 'accepted', reviewer = ?, closed_at = datetime('now') WHERE id = ?"
+        ).run(reviewer, p.id);
+
+        reindexCues(wId);
+
+        const updatedCue = db.prepare('SELECT * FROM cues WHERE id = ?').get(cue.id);
+        const updatedProposal = db.prepare('SELECT * FROM proposals WHERE id = ?').get(p.id);
+        return {
+          ok: true,
+          revision: nextRevision,
+          cue: cueRow(updatedCue),
+          proposal: presentProposal(updatedProposal, updatedCue),
+        };
+      })
+      .immediate(workId, proposalId);
+
+    if (outcome.closed) {
+      throw new HttpError(
+        409,
+        'proposal_closed',
+        `提案已结案（${outcome.proposal.status === 'accepted' ? '已采纳' : '已驳回'}），不可再次处理`,
+        { proposal_id: outcome.proposal.id, status: outcome.proposal.status }
+      );
+    }
+    if (outcome.targetChanged) {
+      // 目标已变：保留待审，返回当前段与原因，不写入
+      throw new HttpError(409, 'target_changed', outcome.issues[0].message, {
+        latest_revision: outcome.revision,
+        proposal: outcome.proposal,
+        issues: outcome.issues,
+      });
+    }
+    if (outcome.rejectedByRules) {
+      // 当前产生交叠/时间非法：保留待审，返回当前段与冲突原因，不写入
+      throw new HttpError(422, 'accept_rejected', '候选修改当前不满足时间/交叠约束，未写入，提案仍在待审区', {
+        latest_revision: outcome.revision,
+        proposal: outcome.proposal,
+        issues: outcome.issues,
+      });
+    }
+
+    res.json({
+      revision: outcome.revision,
+      cue: outcome.cue,
+      proposal: outcome.proposal,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 待审提案：驳回（只结案，不改变正式段与修订号）                      */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/works/:id/proposals/:pid/reject', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const proposalId = Number(req.params.pid);
+    const reviewer = trimName(req.body && req.body.reviewer);
+    getWorkOr404(workId);
+
+    const outcome = db
+      .transaction((wId, pId) => {
+        const w = db.prepare('SELECT id FROM works WHERE id = ?').get(wId);
+        if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+
+        const p = db.prepare('SELECT * FROM proposals WHERE id = ? AND work_id = ?').get(pId, wId);
+        if (!p) throw new HttpError(404, 'proposal_not_found', '提案不存在或不属于该作品');
+        if (p.status !== 'open') {
+          return { closed: true, proposal: p };
+        }
+
+        db.prepare(
+          "UPDATE proposals SET status = 'rejected', reviewer = ?, closed_at = datetime('now') WHERE id = ?"
+        ).run(reviewer, pId);
+
+        const updated = db.prepare('SELECT * FROM proposals WHERE id = ?').get(pId);
+        const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND work_id = ?').get(p.cue_id, wId);
+        return { ok: true, proposal: presentProposal(updated, cue || null) };
+      })
+      .immediate(workId, proposalId);
+
+    if (outcome.closed) {
+      throw new HttpError(
+        409,
+        'proposal_closed',
+        `提案已结案（${outcome.proposal.status === 'accepted' ? '已采纳' : '已驳回'}），不可再次处理`,
+        { proposal_id: outcome.proposal.id, status: outcome.proposal.status }
+      );
+    }
+
+    // 驳回只结案：正式段、作品修订号、SRT 导出都不变
+    res.json({ proposal: outcome.proposal });
   } catch (e) {
     next(e);
   }

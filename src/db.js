@@ -51,6 +51,30 @@ CREATE TABLE IF NOT EXISTS revisions_log (
   cue_id      INTEGER,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 多人校订待审区：单段候选修改。保存提交时原段的时间/文字快照；
+-- 仅采纳成功才更新正式段并推进作品修订号，提交/驳回都不影响正式段与导出。
+CREATE TABLE IF NOT EXISTS proposals (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  work_id        INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+  cue_id         INTEGER NOT NULL,
+  base_revision  INTEGER NOT NULL,
+  cue_idx        INTEGER NOT NULL,
+  orig_start_ms  INTEGER NOT NULL,
+  orig_end_ms    INTEGER NOT NULL,
+  orig_text      TEXT NOT NULL,
+  cand_start_ms  INTEGER NOT NULL,
+  cand_end_ms    INTEGER NOT NULL,
+  cand_text      TEXT NOT NULL,
+  note           TEXT,
+  submitter      TEXT,
+  reviewer       TEXT,
+  status         TEXT NOT NULL DEFAULT 'open', -- open / accepted / rejected
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  closed_at      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_work ON proposals(work_id, status, id);
 `;
 
 function bindParams(stmt, args) {

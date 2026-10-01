@@ -24,6 +24,17 @@
   返回 `409`、最新修订号以及目标字幕段的最新内容；界面就地展示服务器版本，
   校订人人工对照合并后再保存。批量确认同样按修订号乐观锁：预览后作品被他人
   改动则拒绝写入并返回最新修订号，不能按过期预览落库。
+- **待审提案（多人校订）**：不想直接改动正式段时，可把单段的候选起止时间、
+  多行文字和说明提交到**待审区**。提交必须携带页面所见的作品修订号，且服务器
+  会保存提交时原段的**时间与文字快照**；修订号过期或候选内容非法（时间格式、
+  负时间、结束不晚于开始、空文字）一律拒绝，**不生成提案**。提交提案不改变
+  正式段、不推进作品修订号、不影响 SRT 导出。审阅者在待审区可**并列查看原值
+  （快照）、候选值与当前正式值**，逐条**采纳或驳回**：驳回只结案；采纳在
+  **同一事务内**再次确认目标段时间与文字仍与快照一致，并重检非负时间、结束晚于
+  开始及与其他段不交叠——通过才更新正式段、修订号 +1、重排展示序号；目标段已变
+  返回 `409`，当前产生交叠等返回 `422`，两种情况都**保留待审、返回当前段与冲突
+  原因且不写入**。其他段的修改不阻止采纳。已结案（已采纳/已驳回）的提案不可
+  再次处理。
 - **时间约束**：结束必须晚于开始（时间不可为负），新时间段与同作品其他字幕段
   不得交叠（相邻段首尾相接允许）。批量平移时任一新起点为负、选中段彼此或与
   未选段交叠，都**整批拒绝**并指出原因与相关段；违例保存不推进修订号。
@@ -112,20 +123,124 @@ npm test
 覆盖：SRT 解析各类非法输入与行号定位、多行文字、交叠检测、整份不入库、
 乐观锁 409 冲突（含并发双写）、时间/交叠拒绝不推进修订号、批量平移预览
 （负起点/交叠/首尾相接）、批量确认单事务重算与重排、过期预览 409、
-导出重新编号与换行保留、重启持久化等 35 个用例。
+待审提案提交（过期/非法拒绝、快照保存、不改正式段与导出）、驳回结案、
+采纳（快照比对/重检/更新/重排/修订号+1）、其他段改动不阻止、目标已变 409、
+当前交叠 422、已结案不可再处理、级联删除、导出重新编号与换行保留、
+重启持久化等 48 个用例。
 
 ## HTTP 接口摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/works` | 作品列表（含段数、修订号） |
+| `GET` | `/api/works` | 作品列表（含段数、修订号、待审提案数 `open_proposals`） |
 | `POST` | `/api/works` | 上传 SRT：`{title, filename, content}`；失败返回 `422 {error:"invalid_srt", line, message}`，不入库 |
-| `GET` | `/api/works/:id` | 作品详情与按时间排序的字幕段 |
+| `GET` | `/api/works/:id` | 作品详情、按时间排序的字幕段与待审提案数 |
 | `PUT` | `/api/works/:id/cues/:cueId` | 保存单段：`{revision, start, end, text, editor?}`；修订号过期返回 `409 {latest_revision, cue}`，时间/交叠非法返回 `422` |
 | `POST` | `/api/works/:id/cues/shift/preview` | 批量平移预览（不写库），见下 |
 | `POST` | `/api/works/:id/cues/shift` | 确认批量平移：同事务重算应用、修订号 +1、重排展示序号；过期 `409 {latest_revision}`，非法 `422 {issues, cues}` |
+| `GET` | `/api/works/:id/proposals` | 待审提案列表，见下；`?status=all` 含已结案 |
+| `POST` | `/api/works/:id/proposals` | 提交候选修改到待审区，见下 |
+| `POST` | `/api/works/:id/proposals/:pid/accept` | 采纳提案：同事务比对快照并重检，成功才更新正式段 |
+| `POST` | `/api/works/:id/proposals/:pid/reject` | 驳回提案：只结案，不改正式段与修订号 |
 | `GET` | `/api/works/:id/export` | 下载按时间重新编号的标准 SRT |
-| `DELETE` | `/api/works/:id` | 删除作品及其全部字幕段 |
+| `DELETE` | `/api/works/:id` | 删除作品及其全部字幕段与提案 |
+
+## 待审提案 API（多人校订）
+
+### 1) 提交候选修改 `POST /api/works/:id/proposals`
+
+请求体：
+
+```json
+{
+  "revision": 3,
+  "cue_id": 12,
+  "start": "00:00:01,200",
+  "end": "00:00:02,000",
+  "text": "候选文字（可多行）",
+  "note": "听录修正（选填，≤500 字）",
+  "submitter": "阿校对（选填）"
+}
+```
+
+- 必须携带**页面所见修订号** `revision` 与目标段 `cue_id`；时间格式为
+  `HH:MM:SS,mmm`，与单段保存一致。
+- 服务器在事务内核对修订号、段归属，并校验候选内容（非负、结束晚于开始、
+  文字非空）。**提交阶段不检查交叠**——其他段在审期间可能变化，交叠统一在
+  采纳时重检。
+- 成功 `201`，返回提案（含 `original` 快照、`candidate` 候选值、`current`
+  当前正式值、`target_changed`、当前 `conflicts` 列表）。**不改变正式段、
+  不推进修订号、不影响导出。**
+- 失败：修订号过期 `409 {error:"revision_stale", latest_revision, cue}`；
+  候选时间格式 `400 invalid_time`、负时间 `422 negative_time`、区间非法
+  `422 invalid_range`、空文字 `400 invalid_text`、段不存在 `404 cue_not_found`。
+  以上失败**都不会生成提案**。
+
+```bash
+curl -X POST http://localhost:3000/api/works/1/proposals \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":3,"cue_id":12,"start":"00:00:01,200","end":"00:00:02,000","text":"候选文字","note":"听录修正","submitter":"阿校对"}'
+```
+
+### 2) 查看待审区 `GET /api/works/:id/proposals`
+
+默认只返回 `open` 待审提案；加 `?status=all` 返回全部（含 `accepted`/
+`rejected`）。每条提案三值并列：
+
+```json
+{
+  "revision": 4,
+  "open_count": 2,
+  "proposals": [
+    {
+      "id": 7, "work_id": 1, "cue_id": 12, "cue_idx": 2,
+      "status": "open", "base_revision": 3,
+      "submitter": "阿校对", "reviewer": null,
+      "note": "听录修正", "created_at": "…", "closed_at": null,
+      "original":  { "start": "00:00:01,000", "end": "00:00:02,000", "text": "原文", "start_ms": 1000, "end_ms": 2000 },
+      "candidate": { "start": "00:00:01,200", "end": "00:00:02,000", "text": "候选文字", "start_ms": 1200, "end_ms": 2000 },
+      "current":   { "start": "00:00:01,000", "end": "00:00:02,000", "text": "原文", "start_ms": 1000, "end_ms": 2000 },
+      "target_changed": false,
+      "conflicts": []
+    }
+  ]
+}
+```
+
+- `original` 为提交时原段快照，永不变化；`current` 为目标段当前正式值；
+  `target_changed` 表示二者是否已不一致（为 `true` 时采纳会被拒绝）。
+- `conflicts` 为按**当前**正式段计算、候选时间会与之交叠的其他段（含 `idx`
+  与时间）；非空时现在采纳会返回 422。首尾相接不计入。
+
+### 3) 采纳 / 驳回
+
+```bash
+# 采纳（可选 reviewer 署名）
+curl -X POST http://localhost:3000/api/works/1/proposals/7/accept \
+  -H 'Content-Type: application/json' -d '{"reviewer":"审阅老师"}'
+
+# 驳回：只结案，不写正式段、不推进修订号
+curl -X POST http://localhost:3000/api/works/1/proposals/7/reject \
+  -H 'Content-Type: application/json' -d '{"reviewer":"审阅老师"}'
+```
+
+采纳在**同一事务**内依次执行：确认提案属于该作品且仍为 `open` → 读取目标段 →
+比对其时间与文字与快照完全一致 → 重检非负/结束晚于开始 → 重检与其他段不交叠 →
+更新正式段 → 作品修订号 +1 → 重排全部展示序号 → 提案置 `accepted`。
+
+- 成功 `200 {revision, cue, proposal}`，其中 `cue` 为更新后正式段（含重排的
+  `idx`）。
+- 提案不存在 `404 proposal_not_found`；已结案再操作
+  `409 {error:"proposal_closed", status}`。
+- 目标段已变（时间或文字与快照不一致）：
+  `409 {error:"target_changed", latest_revision, proposal, issues}`，
+  **保留待审、不写入**，`proposal.current` 即当前正式段。
+- 目标未变但候选当前会交叠 / 时间非法：
+  `422 {error:"accept_rejected", latest_revision, proposal, issues}`，
+  **同样保留待审、不写入**，`issues[].type` 为 `overlap` / `negative_time` /
+  `invalid_range`，`overlap` 带 `cue_ids`、`cues` 与中文说明。待冲突段移开后，
+  可再次采纳同一条提案。
+- 其他字幕段的修改不阻止采纳；只比对**目标段**快照。
 
 ## 批量时间轴平移 API
 
@@ -235,9 +350,9 @@ curl -X POST http://localhost:3000/api/works/1/cues/shift \
 ├── package.json
 ├── README.md
 ├── src/
-│   ├── server.js      # Express 路由：上传/编辑/批量平移/导出、乐观锁与交叠校验
+│   ├── server.js      # Express 路由：上传/编辑/批量平移/待审提案/导出、乐观锁与交叠校验
 │   ├── shift.js       # 批量平移推演（负起点/交叠检测，碰撞对象）
-│   ├── db.js          # SQLite 存储（sql.js wasm，快照持久化，建表初始化）
+│   ├── db.js          # SQLite 存储（sql.js wasm，快照持久化，建表初始化，含 proposals 表）
 │   └── srt.js         # SRT 严格解析（带行号报错）与标准序列化
 ├── public/            # 浏览器界面（原生 HTML/CSS/JS）
 │   ├── index.html
@@ -257,4 +372,10 @@ curl -X POST http://localhost:3000/api/works/1/cues/shift \
    绿色表示可应用，红色会逐条指出负起点/交叠及相关段。点「确认应用」整批
    同量平移，修订号只增加一次、展示序号自动重排；若预览后作品被他人改动，
    会收到 409 提示，重新载入并重新预览即可；
-5. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。
+5. **多人校订走待审区**：校订人在某段点「提候选」，在弹窗中确认候选起止时间、
+   多行文字并填写说明，提交即携带当前页面修订号进入待审区，正式段不受影响。
+   审阅者在字幕表上方的「待审区」里**并列查看原值、候选值、当前正式值**；
+   黄色「正式值已变化」或红色交叠提示表示现在采纳会被拒绝。逐条点「采纳」
+   （服务器在同一事务内再比对快照并重检时间/交叠，成功才更新正式段、修订号
+   +1、序号重排）或「驳回」（只结案）。已结案的提案不能再次处理；
+6. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。

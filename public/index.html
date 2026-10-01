@@ -98,7 +98,24 @@
         </div>
       </section>
 
-              <div class="table-wrap">
+      <section id="review-panel" class="review-panel">
+        <div class="review-head">
+          <h3>待审区 <span id="review-count" class="review-count"></span></h3>
+          <div class="review-actions">
+            <span id="review-rev" class="shift-rev"></span>
+            <button id="review-refresh" type="button">刷新待审区</button>
+            <label class="review-check"><input type="checkbox" id="review-show-closed" /> 显示已结案</label>
+          </div>
+        </div>
+        <p id="review-empty" class="hint">暂无待审提案。在下方字幕段点「提候选」，候选修改会先进入待审区，不改变正式段。</p>
+        <div id="review-list" class="review-list"></div>
+        <div id="review-closed-wrap" class="review-closed-wrap" hidden>
+          <h4>已结案（不可再次处理）</h4>
+          <div id="review-closed-list" class="review-list"></div>
+        </div>
+      </section>
+
+      <div class="table-wrap">
         <table id="cue-table">
           <thead>
             <tr>
@@ -119,6 +136,35 @@
       <p>从左侧选择一部作品，或上传一份 UTF-8 编码的 SRT 开始校订。</p>
     </div>
   </main>
+
+  <!-- 提交候选修改弹窗：不直接改正式段，先进入待审区 -->
+  <div id="proposal-modal" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="proposal-modal-title">
+      <h3 id="proposal-modal-title">提交候选修改到待审区</h3>
+      <p class="modal-meta">
+        目标字幕段：<strong id="proposal-cue-ref"></strong>
+        · 携带页面修订号 <strong id="proposal-revision"></strong>
+      </p>
+      <p class="hint">候选修改仅作为提案保存，并记录提交时原段的时间/文字快照；不改变正式段与导出。</p>
+      <label class="modal-field">候选开始 <code>HH:MM:SS,mmm</code>
+        <input type="text" id="proposal-start" spellcheck="false" />
+      </label>
+      <label class="modal-field">候选结束
+        <input type="text" id="proposal-end" spellcheck="false" />
+      </label>
+      <label class="modal-field">候选文字（支持多行）
+        <textarea id="proposal-text" rows="4"></textarea>
+      </label>
+      <label class="modal-field">说明（选填）
+        <textarea id="proposal-note" rows="2" maxlength="500" placeholder="例如：听录修正 / 时间轴整体前移"></textarea>
+      </label>
+      <p id="proposal-msg" class="msg" role="status"></p>
+      <div class="modal-actions">
+        <button id="proposal-cancel" type="button">取消</button>
+        <button id="proposal-submit" type="button" class="primary">提交候选</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>
