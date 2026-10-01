@@ -10,6 +10,8 @@ const state = {
   editor: localStorage.getItem('srt-editor') || '',
   // 最近一次批量平移预览：{ revision, offsetMs, cueIds, valid, stale }
   shiftPreview: null,
+  // 当前作品的候选提案（含已结案，前端按勾选过滤展示）
+  proposals: [],
 };
 
 $('#editor-name').value = state.editor;
@@ -140,6 +142,7 @@ async function openWork(id) {
   const r = await api('GET', `/api/works/${id}`);
   state.current = { work: r.work, cues: r.cues, dirty: new Set(), selection: new Set() };
   state.shiftPreview = null;
+  state.proposals = [];
 
   $('#empty-view').hidden = true;
   $('#work-view').hidden = false;
@@ -147,6 +150,10 @@ async function openWork(id) {
   $('#shift-panel').hidden = true;
   $('#shift-offset').value = '';
   $('#shift-select-all').checked = false;
+  $('#proposal-panel').hidden = true;
+  $('#proposal-msg').className = 'msg';
+  $('#proposal-msg').textContent = '';
+  $('#proposal-count').textContent = '0';
 
   $('#work-title-display').textContent = r.work.title;
   $('#work-filename').textContent = r.work.filename;
@@ -158,6 +165,7 @@ async function openWork(id) {
   renderCues();
   updateShiftCount();
   await loadWorks();
+  await loadProposals();
 }
 
 function renderCues() {
@@ -221,15 +229,23 @@ function renderCues() {
     rowMsg.className = 'row-msg';
     textTd.appendChild(rowMsg);
 
-    // 保存
+    // 保存 / 提候选
     const saveTd = document.createElement('td');
     const saveBtn = document.createElement('button');
     saveBtn.className = 'save-btn';
     saveBtn.textContent = '保存';
+    saveBtn.title = '直接保存到正式段（携带当前修订号）';
     saveBtn.addEventListener('click', () =>
       saveCue(tr, cue, { startInput, endInput, ta, rowMsg, saveBtn })
     );
-    saveTd.appendChild(saveBtn);
+    const proposeBtn = document.createElement('button');
+    proposeBtn.className = 'propose-btn';
+    proposeBtn.textContent = '提候选';
+    proposeBtn.title = '把本行输入作为候选修改提交到待审区，不改动正式段';
+    proposeBtn.addEventListener('click', () =>
+      proposeCue(tr, cue, { startInput, endInput, ta, rowMsg, proposeBtn })
+    );
+    saveTd.append(saveBtn, proposeBtn);
 
     const onEdit = () => markDirty(tr, cue);
     startInput.addEventListener('input', onEdit);
@@ -280,6 +296,39 @@ $('#delete-work').addEventListener('click', async () => {
 /* 保存单条：携带修订号，处理 409                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 409 修订号过期的行内展示（保存/提候选共用）。
+ * 返回 true 表示已按过期处理；applyLatest 为「直接采用最新内容」的回调。
+ */
+function handleStaleRow(err, rowMsg, introText, applyLatest) {
+  if (!(err.status === 409 && err.data.error === 'revision_stale')) return false;
+  const latest = err.data.cue;
+  // 更新全局最新修订号，供人工重试携带
+  state.current.work.revision = err.data.latest_revision;
+  $('#work-revision').textContent = err.data.latest_revision;
+  $('#stale-rev').textContent = err.data.latest_revision;
+  $('#stale-banner').hidden = false;
+  invalidateShiftPreview();
+
+  rowMsg.innerHTML = '';
+  const intro = document.createElement('div');
+  intro.textContent =
+    `${introText}（最新修订号 ${err.data.latest_revision}）。` +
+    '请对照下方服务器最新内容，人工合并后再试：';
+  const pre = document.createElement('pre');
+  pre.className = 'latest-snapshot';
+  pre.textContent = `${latest.start} --> ${latest.end}\n${latest.text}`;
+
+  const useLatest = document.createElement('button');
+  useLatest.className = 'linklike';
+  useLatest.type = 'button';
+  useLatest.textContent = '直接采用最新内容（放弃我这行的输入）';
+  useLatest.addEventListener('click', () => applyLatest(latest));
+
+  rowMsg.append(intro, pre, useLatest);
+  return true;
+}
+
 async function saveCue(tr, cue, els) {
   const { startInput, endInput, ta, rowMsg, saveBtn } = els;
   rowMsg.className = 'row-msg';
@@ -316,46 +365,23 @@ async function saveCue(tr, cue, els) {
     $('#stale-banner').hidden = true;
     // 本地修订号已推进，此前的批量平移预览失效
     invalidateShiftPreview();
+    // 正式段已变：待审区里针对该段的提案快照可能不再匹配，刷新对照
+    loadProposals().catch(() => {});
   } catch (err) {
     tr.classList.add('row-err');
     rowMsg.classList.add('error');
 
-    if (err.status === 409 && err.data.error === 'revision_stale') {
-      const latest = err.data.cue;
-      // 更新全局最新修订号，供人工重试携带
-      state.current.work.revision = err.data.latest_revision;
-      $('#work-revision').textContent = err.data.latest_revision;
-      $('#stale-rev').textContent = err.data.latest_revision;
-      $('#stale-banner').hidden = false;
-      invalidateShiftPreview();
-
-      rowMsg.innerHTML = '';
-      const intro = document.createElement('div');
-      intro.textContent =
-        `修订号过期，已拒绝覆盖（最新修订号 ${err.data.latest_revision}）。` +
-        '请对照下方服务器最新内容，人工合并后再保存：';
-      const pre = document.createElement('pre');
-      pre.className = 'latest-snapshot';
-      pre.textContent =
-        `${latest.start} --> ${latest.end}\n${latest.text}`;
-
-      const useLatest = document.createElement('button');
-      useLatest.className = 'linklike';
-      useLatest.type = 'button';
-      useLatest.textContent = '直接采用最新内容（放弃我这行的输入）';
-      useLatest.addEventListener('click', () => {
-        startInput.value = latest.start;
-        endInput.value = latest.end;
-        ta.value = latest.text;
-        ta.rows = Math.max(1, ta.value.split('\n').length);
-        Object.assign(cue, latest);
-        clearDirty(tr, cue);
-        rowMsg.className = 'row-msg';
-        rowMsg.textContent = '已填入最新版本；如仍需调整可直接修改后保存。';
-      });
-
-      rowMsg.append(intro, pre, useLatest);
-    } else {
+    const stale = handleStaleRow(err, rowMsg, '修订号过期，已拒绝覆盖', (latest) => {
+      startInput.value = latest.start;
+      endInput.value = latest.end;
+      ta.value = latest.text;
+      ta.rows = Math.max(1, ta.value.split('\n').length);
+      Object.assign(cue, latest);
+      clearDirty(tr, cue);
+      rowMsg.className = 'row-msg';
+      rowMsg.textContent = '已填入最新版本；如仍需调整可直接修改后保存。';
+    });
+    if (!stale) {
       rowMsg.textContent = err.message;
     }
   } finally {
@@ -363,6 +389,276 @@ async function saveCue(tr, cue, els) {
     tr.classList.remove('saving');
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 候选修改待审区：提交候选、并列对照、采纳 / 驳回                     */
+/* ------------------------------------------------------------------ */
+
+/** 把本行输入作为候选提交到待审区（正式段不变） */
+async function proposeCue(tr, cue, els) {
+  const { startInput, endInput, ta, rowMsg, proposeBtn } = els;
+  rowMsg.className = 'row-msg';
+  rowMsg.textContent = '';
+  tr.classList.remove('row-err');
+
+  const note = prompt('候选说明（选填）：提交后进入待审区，由审阅人对照采纳或驳回；正式段不会被改动。');
+  if (note === null) return; // 用户取消
+
+  const payload = {
+    revision: state.current.work.revision,
+    start: startInput.value.trim(),
+    end: endInput.value.trim(),
+    text: ta.value,
+    note: note.trim() || null,
+    editor: state.editor || null,
+  };
+
+  proposeBtn.disabled = true;
+  try {
+    const r = await api(
+      'POST',
+      `/api/works/${state.current.work.id}/cues/${cue.id}/proposals`,
+      payload
+    );
+    rowMsg.classList.add('ok');
+    rowMsg.textContent = `候选 #${r.proposal.id} 已进入待审区（正式段未改动）`;
+    await loadProposals();
+  } catch (err) {
+    tr.classList.add('row-err');
+    rowMsg.classList.add('error');
+    const stale = handleStaleRow(err, rowMsg, '修订号过期，候选未提交', (latest) => {
+      startInput.value = latest.start;
+      endInput.value = latest.end;
+      ta.value = latest.text;
+      ta.rows = Math.max(1, ta.value.split('\n').length);
+      Object.assign(cue, latest);
+      clearDirty(tr, cue);
+      rowMsg.className = 'row-msg';
+      rowMsg.textContent = '已填入最新版本；如需提交候选请重新修改后再试。';
+    });
+    if (!stale) {
+      rowMsg.textContent = err.message;
+    }
+  } finally {
+    proposeBtn.disabled = false;
+  }
+}
+
+async function loadProposals() {
+  if (!state.current) return;
+  const r = await api('GET', `/api/works/${state.current.work.id}/proposals`);
+  state.proposals = r.proposals;
+  const pending = state.proposals.filter((p) => p.status === 'pending');
+  $('#proposal-count').textContent = String(pending.length);
+  $('#proposal-toggle').classList.toggle('has-pending', pending.length > 0);
+  renderProposals();
+}
+
+function setProposalMsg(kind, text) {
+  const el = $('#proposal-msg');
+  el.className = `msg ${kind}`;
+  el.textContent = text;
+}
+
+/** 三段值单元格：时间 + 多行文字 */
+function proposalValueCell(value, extraClass) {
+  const td = document.createElement('td');
+  td.className = `prop-val${extraClass ? ` ${extraClass}` : ''}`;
+  if (!value) {
+    td.textContent = '（段已不存在）';
+    return td;
+  }
+  const tc = document.createElement('div');
+  tc.className = 'tc';
+  tc.textContent = `${value.start} --> ${value.end}`;
+  const tx = document.createElement('div');
+  tx.className = 'tx';
+  tx.textContent = value.text;
+  td.append(tc, tx);
+  return td;
+}
+
+function renderProposals() {
+  const tbody = $('#proposal-tbody');
+  tbody.innerHTML = '';
+
+  const showClosed = $('#proposal-show-closed').checked;
+  const pending = state.proposals.filter((p) => p.status === 'pending');
+  const closed = showClosed ? state.proposals.filter((p) => p.status !== 'pending') : [];
+  const list = [...pending, ...closed];
+
+  if (list.length === 0) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.className = 'prop-empty';
+    td.textContent =
+      state.proposals.length === 0
+        ? '待审区为空：在字幕行内修改后点「提候选」即可提交。'
+        : '没有待审提案；勾选「显示已结案」可查看历史。';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+
+  for (const p of list) {
+    const tr = document.createElement('tr');
+    tr.className = p.status === 'pending' ? 'pending' : 'closed';
+
+    // 段定位：当前展示序号 + 段 ID
+    const idxTd = document.createElement('td');
+    idxTd.className = 'col-idx';
+    idxTd.textContent = p.current ? `#${p.current.idx}` : '—';
+    idxTd.title = `段 ID ${p.cue_id}`;
+
+    // 提交者 / 说明
+    const metaTd = document.createElement('td');
+    metaTd.className = 'prop-meta';
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = p.editor || '（未署名）';
+    const when = document.createElement('div');
+    when.className = 'when';
+    when.textContent = `${p.created_at} · 基于修订 ${p.base_revision}`;
+    metaTd.append(who, when);
+    if (p.note) {
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = p.note;
+      metaTd.appendChild(note);
+    }
+
+    const snapTd = proposalValueCell(p.snapshot, 'snap');
+    const candTd = proposalValueCell(p.candidate, 'cand');
+    const curTd = proposalValueCell(p.current, 'cur');
+    if (p.status === 'pending' && p.changed) {
+      curTd.classList.add('drifted');
+      const warn = document.createElement('div');
+      warn.className = 'drift-warn';
+      warn.textContent = '⚠ 正式值已偏离快照，直接采纳会被拒绝';
+      curTd.appendChild(warn);
+    }
+
+    // 操作 / 状态
+    const actTd = document.createElement('td');
+    actTd.className = 'prop-actions';
+    if (p.status === 'pending') {
+      const acceptBtn = document.createElement('button');
+      acceptBtn.className = 'accept-btn';
+      acceptBtn.textContent = '采纳';
+      acceptBtn.title = '校验通过后写入正式段（修订号 +1）';
+      acceptBtn.addEventListener('click', () => acceptProposal(p));
+      const rejectBtn = document.createElement('button');
+      rejectBtn.className = 'reject-btn';
+      rejectBtn.textContent = '驳回';
+      rejectBtn.title = '驳回即结案，不可再次处理';
+      rejectBtn.addEventListener('click', () => rejectProposal(p));
+      actTd.append(acceptBtn, rejectBtn);
+    } else {
+      const badge = document.createElement('span');
+      badge.className = `prop-badge ${p.status}`;
+      badge.textContent = p.status === 'accepted' ? '已采纳' : '已驳回';
+      const by = document.createElement('div');
+      by.className = 'when';
+      by.textContent = `${p.reviewer || '（未署名）'} · ${p.resolved_at || ''}`;
+      actTd.append(badge, by);
+    }
+
+    tr.append(idxTd, metaTd, snapTd, candTd, curTd, actTd);
+    tbody.appendChild(tr);
+  }
+}
+
+/** 采纳成功后同步本地状态：修订号推进、正式段刷新 */
+function applyAcceptedCue(r) {
+  state.current.work.revision = r.revision;
+  $('#work-revision').textContent = r.revision;
+  invalidateShiftPreview();
+
+  if (state.current.dirty.size === 0) {
+    // 无未保存输入：直接按服务器重排结果整体刷新字幕表
+    state.current.cues = r.cues;
+    renderCues();
+    document.querySelectorAll('#cue-tbody tr').forEach((tr) => {
+      const id = Number(tr.dataset.cueId);
+      if (state.current.selection.has(id)) {
+        tr.querySelector('.cue-pick').checked = true;
+        tr.classList.add('picked');
+      }
+    });
+  } else {
+    // 有未保存输入：只更新该段基线并提示人工刷新，避免覆盖正在编辑的内容
+    const local = state.current.cues.find((c) => c.id === r.cue.id);
+    if (local) Object.assign(local, r.cue);
+    $('#stale-rev').textContent = r.revision;
+    $('#stale-banner').hidden = false;
+  }
+}
+
+async function acceptProposal(p) {
+  setProposalMsg('', '');
+  try {
+    const r = await api(
+      'POST',
+      `/api/works/${state.current.work.id}/proposals/${p.id}/accept`,
+      { editor: state.editor || null }
+    );
+    applyAcceptedCue(r);
+    setProposalMsg('ok', `候选 #${p.id} 已采纳：正式段已更新，修订号 ${r.revision}。`);
+    await loadProposals();
+  } catch (err) {
+    if (err.status === 409 && err.data.error === 'proposal_conflict') {
+      // 目标已变或会交叠：提案保留待审，刷新并列对照展示当前正式值
+      setProposalMsg('error', `候选 #${p.id} 未采纳：${err.data.message}`);
+      await loadProposals();
+    } else if (err.status === 409 && err.data.error === 'proposal_closed') {
+      setProposalMsg('error', `候选 #${p.id} ${err.data.message}`);
+      await loadProposals();
+    } else {
+      setProposalMsg('error', err.message);
+    }
+  }
+}
+
+async function rejectProposal(p) {
+  if (!confirm(`驳回候选 #${p.id}？驳回即结案，不可再次处理。`)) return;
+  try {
+    await api(
+      'POST',
+      `/api/works/${state.current.work.id}/proposals/${p.id}/reject`,
+      { editor: state.editor || null }
+    );
+    setProposalMsg('ok', `候选 #${p.id} 已驳回结案（正式段未改动）。`);
+    await loadProposals();
+  } catch (err) {
+    setProposalMsg('error', err.message);
+    if (err.status === 409) await loadProposals();
+  }
+}
+
+$('#proposal-toggle').addEventListener('click', async () => {
+  const panel = $('#proposal-panel');
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) {
+    try {
+      await loadProposals();
+    } catch (err) {
+      setProposalMsg('error', err.message);
+    }
+  }
+});
+
+$('#proposal-refresh').addEventListener('click', async () => {
+  $('#proposal-panel').hidden = false;
+  try {
+    await loadProposals();
+    setProposalMsg('', '');
+  } catch (err) {
+    setProposalMsg('error', err.message);
+  }
+});
+
+$('#proposal-show-closed').addEventListener('change', renderProposals);
 
 /* ------------------------------------------------------------------ */
 /* 批量时间轴平移：勾选、预览、确认                                    */

@@ -203,7 +203,7 @@ thead th {
 .col-idx { width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .col-pick { width: 34px; text-align: center; }
 .col-time { width: 150px; }
-.col-save { width: 84px; }
+.col-save { width: 92px; }
 
 tr.picked td { background: #f0f7f3; }
 
@@ -317,7 +317,7 @@ tr.row-err input, tr.row-err textarea { border-color: var(--danger); }
 .row-msg.error { color: var(--danger); }
 .row-msg.ok { color: var(--brand-dark); }
 
-.save-btn { padding: 5px 10px; }
+.save-btn { display: block; width: 100%; padding: 5px 10px; }
 .save-btn:disabled { opacity: 0.5; cursor: default; }
 
 .latest-snapshot {
@@ -329,3 +329,124 @@ tr.row-err input, tr.row-err textarea { border-color: var(--danger); }
   font: 12px/1.5 ui-monospace, Consolas, monospace;
   white-space: pre-wrap;
 }
+
+/* ---------------- 候选修改待审区 ---------------- */
+
+.proposal-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin: 0 0 12px;
+}
+
+#proposal-toggle.has-pending {
+  border-color: var(--warn-line);
+  background: var(--warn-bg);
+  font-weight: 600;
+}
+
+.proposal-show-closed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.hint-inline { font-size: 12.5px; color: var(--muted); }
+
+.proposal-panel {
+  background: var(--panel);
+  border: 1px solid var(--brand);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 0 0 12px;
+}
+
+.proposal-panel-head h3 { margin: 0 0 4px; font-size: 15px; }
+.proposal-panel-head .hint { margin: 0 0 6px; }
+
+.proposal-table-wrap {
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.proposal-table-wrap table { width: 100%; }
+
+.col-prop-meta { width: 170px; }
+.col-prop-actions { width: 110px; }
+
+.prop-meta .who { font-weight: 600; }
+.prop-meta .when { font-size: 12px; color: var(--muted); }
+.prop-meta .note {
+  margin-top: 4px;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  background: #f8fafc;
+  border-radius: 6px;
+  padding: 4px 7px;
+}
+
+.prop-val { min-width: 150px; }
+.prop-val .tc {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.prop-val .tx {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "PingFang SC", monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+}
+.prop-val.cand { background: #f0f7f3; }
+.prop-val.cur.drifted { background: var(--warn-bg); }
+
+.drift-warn {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--warn-line);
+}
+
+tr.closed td { background: #f6f7f9; color: var(--muted); }
+
+.prop-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 18px 10px;
+}
+
+.prop-actions button { display: block; width: 100%; margin-bottom: 6px; padding: 5px 10px; }
+.accept-btn {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.accept-btn:hover { background: var(--brand-dark); }
+.reject-btn { color: var(--danger); border-color: #f3b6b0; }
+.reject-btn:hover { background: #fff5f4; }
+
+.prop-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.prop-badge.accepted { background: var(--ok-bg); color: var(--brand-dark); }
+.prop-badge.rejected { background: var(--err-bg); color: var(--danger); }
+
+.propose-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+}
+.propose-btn:disabled { opacity: 0.5; cursor: default; }

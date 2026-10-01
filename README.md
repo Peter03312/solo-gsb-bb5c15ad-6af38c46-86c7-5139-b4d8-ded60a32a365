@@ -24,6 +24,14 @@
   返回 `409`、最新修订号以及目标字幕段的最新内容；界面就地展示服务器版本，
   校订人人工对照合并后再保存。批量确认同样按修订号乐观锁：预览后作品被他人
   改动则拒绝写入并返回最新修订号，不能按过期预览落库。
+- **候选修改待审区**：多人校订时，单段修改可以先作为**候选提案**提交到待审区
+  （携带页面所见修订号与说明；号已过期或内容非法直接拒绝、不生成提案）。
+  提案冻结原段时间与文字快照，**不改变正式段、作品修订号或 SRT 导出**。
+  审阅人并列对照「原值 / 候选值 / 当前正式值」后逐条**采纳**或**驳回**：
+  采纳在同一事务内确认目标段仍与快照一致、并重查非负时间/结束晚于开始/
+  不与其他段交叠，成功后写入正式段、修订号 +1、重排序号；其他段的修改不阻止
+  采纳，目标已变或会交叠时提案保留待审并返回当前段与冲突原因。驳回只结案，
+  已结案提案不可再次处理。
 - **时间约束**：结束必须晚于开始（时间不可为负），新时间段与同作品其他字幕段
   不得交叠（相邻段首尾相接允许）。批量平移时任一新起点为负、选中段彼此或与
   未选段交叠，都**整批拒绝**并指出原因与相关段；违例保存不推进修订号。
@@ -112,7 +120,9 @@ npm test
 覆盖：SRT 解析各类非法输入与行号定位、多行文字、交叠检测、整份不入库、
 乐观锁 409 冲突（含并发双写）、时间/交叠拒绝不推进修订号、批量平移预览
 （负起点/交叠/首尾相接）、批量确认单事务重算与重排、过期预览 409、
-导出重新编号与换行保留、重启持久化等 35 个用例。
+候选提案提交（过期/非法不生成提案）、采纳（快照一致校验、交叠复查、
+重排序号、目标已变/交叠冲突保留待审）、驳回结案与结案后不可再处理、
+导出重新编号与换行保留、重启持久化等 45 个用例。
 
 ## HTTP 接口摘要
 
@@ -122,6 +132,10 @@ npm test
 | `POST` | `/api/works` | 上传 SRT：`{title, filename, content}`；失败返回 `422 {error:"invalid_srt", line, message}`，不入库 |
 | `GET` | `/api/works/:id` | 作品详情与按时间排序的字幕段 |
 | `PUT` | `/api/works/:id/cues/:cueId` | 保存单段：`{revision, start, end, text, editor?}`；修订号过期返回 `409 {latest_revision, cue}`，时间/交叠非法返回 `422` |
+| `POST` | `/api/works/:id/cues/:cueId/proposals` | 提交候选修改到待审区：`{revision, start, end, text, note?, editor?}`；过期 `409`、非法 `400/422`，均不生成提案 |
+| `GET` | `/api/works/:id/proposals` | 待审区列表（`?status=pending/accepted/rejected/all`），每条含原值快照、候选值、当前正式值 |
+| `POST` | `/api/works/:id/proposals/:pid/accept` | 采纳候选：`{editor?}`；成功写入正式段、修订号 +1、重排序号；冲突 `409 {reason, cue}` 保留待审，已结案 `409 proposal_closed` |
+| `POST` | `/api/works/:id/proposals/:pid/reject` | 驳回候选：`{editor?}`；只结案，不动正式段与修订号；已结案 `409 proposal_closed` |
 | `POST` | `/api/works/:id/cues/shift/preview` | 批量平移预览（不写库），见下 |
 | `POST` | `/api/works/:id/cues/shift` | 确认批量平移：同事务重算应用、修订号 +1、重排展示序号；过期 `409 {latest_revision}`，非法 `422 {issues, cues}` |
 | `GET` | `/api/works/:id/export` | 下载按时间重新编号的标准 SRT |
@@ -226,6 +240,90 @@ curl -X POST http://localhost:3000/api/works/1/cues/shift \
 
 随后 `GET /api/works/:id/export` 导出的 SRT 自动按新时间排序、从 1 连续编号。
 
+## 候选修改待审区 API
+
+多人校订时，单段修改可以不直接落正式段，而是先提交为**候选提案**进入待审区，
+由审阅人逐条采纳或驳回。提案状态机：`pending` →（采纳）`accepted` /
+（驳回）`rejected`；结案后不可再次处理。
+
+### 1) 提交候选 `POST /api/works/:id/cues/:cueId/proposals`
+
+```bash
+curl -X POST http://localhost:3000/api/works/1/cues/12/proposals \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":4,"start":"00:00:04,500","end":"00:00:04,700",
+       "text":"甲改\n第二行","note":"标点与断行建议","editor":"小提交"}'
+```
+
+- `revision`（必填）：**页面所见作品修订号**。与服务器当前不一致时返回
+  `409 {"error":"revision_stale","latest_revision":N,"cue":{...}}`，不生成提案。
+- `start` / `end` / `text`：候选起止时间与多行文字，校验规则与单段保存相同
+  （格式 `400 invalid_time`、结束不晚于开始 `422 invalid_range`、空文字
+  `400 invalid_text`、与其他段交叠 `422 overlap`），任何一项非法都拒绝且
+  不生成提案。
+- `note`（选填，≤1000 字）：给审阅人的说明；`editor`（选填，≤80 字）：提交者署名。
+
+成功返回 `201`，提案冻结**原段时间与文字快照**（`snapshot`）与候选值
+（`candidate`），正式段、作品修订号、SRT 导出均不受影响：
+
+```json
+{
+  "proposal": {
+    "id": 1, "cue_id": 12, "status": "pending", "base_revision": 4,
+    "editor": "小提交", "note": "标点与断行建议",
+    "snapshot":  {"start": "00:00:01,000", "end": "00:00:02,000", "text": "甲", "start_ms": 1000, "end_ms": 2000},
+    "candidate": {"start": "00:00:04,500", "end": "00:00:04,700", "text": "甲改\n第二行", "start_ms": 4500, "end_ms": 4700},
+    "current":   {"id": 12, "idx": 1, "start": "00:00:01,000", "end": "00:00:02,000", "text": "甲"},
+    "changed": false
+  }
+}
+```
+
+### 2) 待审区列表 `GET /api/works/:id/proposals?status=pending`
+
+`status` 可取 `pending` / `accepted` / `rejected` / `all`（缺省为 `all`，
+其他值 `400 invalid_status`）。每条提案并列返回 `snapshot`（原值）、
+`candidate`（候选值）、`current`（当前正式值），`changed: true` 表示当前
+正式值已偏离提交时快照（此时采纳会被拒绝）。响应同时附作品当前 `revision`。
+
+### 3) 采纳 `POST /api/works/:id/proposals/:pid/accept`
+
+```bash
+curl -X POST http://localhost:3000/api/works/1/proposals/1/accept \
+  -H 'Content-Type: application/json' -d '{"editor":"审阅甲"}'
+```
+
+服务器在**同一事务**内：确认目标段的时间与文字仍与快照一致（**其他段的修改
+不阻止采纳**，因此无需携带修订号）→ 重新检查候选非负时间、结束晚于开始、
+不与其他段交叠 → 写入正式段 → 修订号 +1 → 重排全部展示序号 → 提案结案。
+成功返回 `200 {revision, cue, cues, proposal}`（`cues` 为重排后的全部段）。
+
+冲突时提案**保留待审、不写入任何内容**，返回 `409` 与当前段及原因：
+
+```json
+{
+  "error": "proposal_conflict",
+  "reason": "target_changed",
+  "message": "目标字幕段在提案提交后已被修改，与快照不一致；提案保留在待审区，未写入",
+  "cue": {"id": 12, "idx": 1, "start": "00:00:01,000", "end": "00:00:02,000", "text": "甲（已被他人修改）"},
+  "proposal": {"id": 1, "status": "pending", "changed": true}
+}
+```
+
+`reason` 取值：`target_changed`（目标段已偏离快照）、`overlap`（候选时间段
+当前会与其他段交叠，另附 `overlap_with` 交叠对象）、`target_missing`
+（目标段已不存在）。提案已结案时返回 `409 {"error":"proposal_closed","status":"accepted|rejected"}`。
+
+### 4) 驳回 `POST /api/works/:id/proposals/:pid/reject`
+
+```bash
+curl -X POST http://localhost:3000/api/works/1/proposals/2/reject \
+  -H 'Content-Type: application/json' -d '{"editor":"审阅甲"}'
+```
+
+只把提案结案为 `rejected`（记录审阅者与结案时间），正式段与作品修订号不变。
+已结案提案再次采纳/驳回均返回 `409 proposal_closed`。
+
 ## 目录结构
 
 ```
@@ -235,7 +333,7 @@ curl -X POST http://localhost:3000/api/works/1/cues/shift \
 ├── package.json
 ├── README.md
 ├── src/
-│   ├── server.js      # Express 路由：上传/编辑/批量平移/导出、乐观锁与交叠校验
+│   ├── server.js      # Express 路由：上传/编辑/待审区/批量平移/导出、乐观锁与交叠校验
 │   ├── shift.js       # 批量平移推演（负起点/交叠检测，碰撞对象）
 │   ├── db.js          # SQLite 存储（sql.js wasm，快照持久化，建表初始化）
 │   └── srt.js         # SRT 严格解析（带行号报错）与标准序列化
@@ -252,9 +350,13 @@ curl -X POST http://localhost:3000/api/works/1/cues/shift \
 2. 各人在「校订人署名」填自己的名字（随修改记录保存）；
 3. 改一段点一段的「保存」。若期间别人先保存过，该段会出现黄色冲突提示，
    其中附有服务器最新内容；对照合并后再次保存即可；
-4. 需要整体挪动时间轴时，勾选若干字幕段（或「全选」），在工具条输入有符号
+4. 不确定的修改点「提候选」：填入说明后进入**待审区**，正式段不受影响。
+   审阅人点开「待审区」并列对照原值、候选值与当前正式值，逐条「采纳」
+   （校验通过后写入正式段、修订号 +1）或「驳回」（只结案）。若目标段已被
+   他人改动或候选会与其他段交叠，采纳会被拒绝并提示原因，提案保留待审；
+5. 需要整体挪动时间轴时，勾选若干字幕段（或「全选」），在工具条输入有符号
    整数毫秒偏移量并点「预览调整」：面板逐段列出调整前后时间与碰撞对象；
    绿色表示可应用，红色会逐条指出负起点/交叠及相关段。点「确认应用」整批
    同量平移，修订号只增加一次、展示序号自动重排；若预览后作品被他人改动，
    会收到 409 提示，重新载入并重新预览即可；
-5. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。
+6. 校订完成后点右上角「导出标准 SRT」，文件可直接用于放映软件。

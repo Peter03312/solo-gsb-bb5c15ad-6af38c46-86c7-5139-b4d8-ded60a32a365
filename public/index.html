@@ -62,7 +62,7 @@
         未保存的修改请人工对照后重试。
       </div>
 
-      <p class="hint">时间格式 <code>HH:MM:SS,mmm</code>；相邻字幕首尾可以相接，但不能交叠。文字支持多行换行。</p>
+      <p class="hint">时间格式 <code>HH:MM:SS,mmm</code>；相邻字幕首尾可以相接，但不能交叠。文字支持多行换行。「保存」直接改正式段；「提候选」把本行修改送入待审区，由审阅人采纳或驳回。</p>
 
       <section id="shift-bar" class="shift-bar">
         <label class="shift-check"><input type="checkbox" id="shift-select-all" /> 全选</label>
@@ -94,6 +94,43 @@
               </tr>
             </thead>
             <tbody id="shift-preview-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="proposal-bar" class="proposal-bar">
+        <button id="proposal-toggle" type="button">
+          待审区（<span id="proposal-count">0</span> 条待审）
+        </button>
+        <label class="proposal-show-closed">
+          <input type="checkbox" id="proposal-show-closed" /> 显示已结案
+        </label>
+        <button id="proposal-refresh" type="button" class="linklike">刷新</button>
+        <span class="hint-inline">候选修改先进入待审区，采纳后才写入正式段</span>
+      </section>
+
+      <section id="proposal-panel" class="proposal-panel" hidden>
+        <div class="proposal-panel-head">
+          <h3>候选修改待审区</h3>
+          <p class="hint">
+            并列对照「原值（提交时快照）/ 候选值 / 当前正式值」。采纳会校验目标段未被他人改动、
+            候选时间合法且不与其它段交叠，成功后修订号 +1 并重排序号；目标已变或会交叠时提案保留待审。
+          </p>
+        </div>
+        <p id="proposal-msg" class="msg" role="status"></p>
+        <div class="proposal-table-wrap">
+          <table id="proposal-table">
+            <thead>
+              <tr>
+                <th class="col-idx">段</th>
+                <th class="col-prop-meta">提交者 / 说明</th>
+                <th>原值（快照）</th>
+                <th>候选值</th>
+                <th>当前正式值</th>
+                <th class="col-prop-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="proposal-tbody"></tbody>
           </table>
         </div>
       </section>
